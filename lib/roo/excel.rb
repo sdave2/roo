@@ -1,4 +1,7 @@
+require 'rubygems'
 require 'spreadsheet'
+#require 'lib/roo/generic_spreadsheet'
+#require 'parseexcel'
 CHARGUESS = begin
   require 'charguess'
   true
@@ -10,6 +13,26 @@ end
 # base dates so if the file is a 1904 base date then 
 # dates are off by a day. 1900 base dates work fine
 module Spreadsheet
+  module ExcelFontExtensions
+    class Row < Spreadsheet::Row
+      def _date data # :nodoc:
+        return data if data.is_a?(Date)
+        date = @worksheet.date_base + data.to_i
+        if LEAP_ERROR > @worksheet.date_base
+          date -= 1
+        end
+        date
+      end
+      public :_datetime
+    end
+  end
+end
+
+#=====================================================================
+# TODO:
+# redefinition of this method, the method in the spreadsheet gem has a bug
+# redefinition can be removed, if spreadsheet does it in the correct way
+module Spreadsheet
   module Excel
     class Row < Spreadsheet::Row
       def _datetime data # :nodoc:
@@ -18,9 +41,10 @@ module Spreadsheet
         date = base + data.to_f
         hour = (data % 1) * 24
         min  = (hour % 1) * 60
-        sec  = ((min % 1) * 60).round
-        min = min.floor
-        hour = hour.floor
+        f = ((min % 1) * 60)
+        sec = f.respond_to?(:round) ? f.round : 0
+        min = min.respond_to?(:round) ? min.floor : 0
+        hour = hour.respond_to?(:round) ? hour.floor : 0
         if sec > 59
           sec = 0
           min += 1
@@ -38,45 +62,10 @@ module Spreadsheet
         end
         DateTime.new(date.year, date.month, date.day, hour, min, sec)
       end
-      public :_date
-      public :_datetime
-    end
-    # patch for ruby-spreadsheet parsing formulas
-    class Reader
-      def read_formula worksheet, addr, work
-        row, column, xf, rtype, rval, rcheck, opts = work.unpack 'v3CxCx3v2'
-        formula = Formula.new
-        formula.shared = (opts & 0x08) > 0
-        formula.data = work[20..-1]
-        if rcheck != 0xffff || rtype > 3 
-          value, = work.unpack 'x6E'
-          unless value
-            # on architectures where sizeof(double) > 8
-            value, = work.unpack 'x6e'
-          end
-          formula.value = value
-        elsif rtype == 0
-          pos, op, len, work = get_next_chunk
-          if op == :string
-            formula.value = client read_string(work, 2), @workbook.encoding
-          else
-            # This seems to work but I don't know why :). It at least
-            # seems to correct the case we saw but doubtful it's the right fix
-            formula.value = client read_string(work[10..-1], 2), @workbook.encoding
-          end
-        elsif rtype == 1
-          formula.value = rval > 0
-        elsif rtype == 2
-          formula.value = Error.new rval
-        else
-          # leave the Formula value blank
-        end
-        set_cell worksheet, row, column, xf, formula
-      end
     end
   end
 end
-
+#=====================================================================
 
 # ruby-spreadsheet has a font object so we're extending it 
 # with our own functionality but still providing full access
@@ -86,9 +75,9 @@ module ExcelFontExtensions
     #From ruby-spreadsheet doc: 100 <= weight <= 1000, bold => 700, normal => 400
     case weight
     when 700    
-     true
+      true
     else
-     false
+      false
     end   
   end
 
@@ -105,14 +94,15 @@ end
 # Class for handling Excel-Spreadsheets
 class Excel < GenericSpreadsheet 
 
-  EXCEL_NO_FORMULAS = 'formulas are not supported for excel spreadsheets'
+  EXCEL_NO_FORMULAS = 'Formulas are not supported for excel spreadsheets.'
 
   # Creates a new Excel spreadsheet object.
   # Parameter packed: :zip - File is a zip-file
   def initialize(filename, packed = nil, file_warning = :error)
     super()
     @file_warning = file_warning
-    @tmpdir = "oo_"+$$.to_s
+    file_type_check(filename,'.xls','an Excel',packed)
+    @tmpdir = GenericSpreadsheet.next_tmpdir
     @tmpdir = File.join(ENV['ROO_TMP'], @tmpdir) if ENV['ROO_TMP'] 
     unless File.exists?(@tmpdir)
       FileUtils::mkdir(@tmpdir)
@@ -120,19 +110,19 @@ class Excel < GenericSpreadsheet
     filename = open_from_uri(filename) if filename[0,7] == "http://"
     filename = open_from_stream(filename[7..-1]) if filename[0,7] == "stream:"
     filename = unzip(filename) if packed and packed == :zip
-    begin
-      file_type_check(filename,'.xls','an Excel')
-      @filename = filename
-      unless File.file?(@filename)
-        raise IOError, "file #{@filename} does not exist"
-      end
-      @workbook = Spreadsheet.open(filename)
-      @default_sheet = self.sheets.first
-    ensure
-      #if ENV["roo_local"] != "thomas-p"
+    @filename = filename
+    unless File.file?(@filename)
       FileUtils::rm_r(@tmpdir)
-      #end
+      raise IOError, "file #{@filename} does not exist"
     end
+    begin
+      @workbook = Spreadsheet.open(filename)
+    rescue Ole::Storage::FormatError
+      FileUtils::rm_r(@tmpdir)
+      raise # nach aussen weiterhin sichtbar
+    end
+    @default_sheet = self.sheets.first
+    FileUtils::rm_r(@tmpdir)
     @cell = Hash.new
     @cell_type = Hash.new
     @formula = Hash.new
@@ -147,11 +137,7 @@ class Excel < GenericSpreadsheet
 
   # returns an array of sheet names in the spreadsheet
   def sheets
-    result = []
-    @workbook.worksheets.each do |worksheet| 
-      result << normalize_string(worksheet.name)
-    end
-    return result
+    @workbook.worksheets.collect {|worksheet| normalize_string(worksheet.name)}
   end
 
   # returns the content of a cell. The upper left corner is (1,1) or ('A',1)
@@ -168,7 +154,11 @@ class Excel < GenericSpreadsheet
     if celltype(row,col,sheet) == :string
       return platform_specific_iconv(@cell[sheet][[row,col]])
     else
-      return @cell[sheet][[row,col]]
+      if @cell[sheet] and @cell[sheet][[row,col]]
+        return @cell[sheet][[row,col]]
+      else
+        return nil
+      end
     end
   end
 
@@ -185,10 +175,14 @@ class Excel < GenericSpreadsheet
     read_cells(sheet) unless @cells_read[sheet]
     row,col = normalize(row,col)
     begin
-      if @formula[sheet][[row,col]]
+      if @formula[sheet] and @formula[sheet][[row,col]]
         return :formula
       else
-        @cell_type[sheet][[row,col]]
+        if @cell_type[sheet] and @cell_type[sheet][[row,col]]
+          return @cell_type[sheet][[row,col]]
+        else
+          return nil
+        end
       end
     rescue
       puts "Error in sheet #{sheet}, row #{row}, col #{col}"
@@ -198,17 +192,17 @@ class Excel < GenericSpreadsheet
 
   # returns NO formula in excel spreadsheets
   def formula(row,col,sheet=nil)
-    raise EXCEL_NO_FORMULAS
+    wait_for_version_080
   end
 
   # raises an exception because formulas are not supported for excel files
   def formula?(row,col,sheet=nil)
-    raise EXCEL_NO_FORMULAS
+    wait_for_version_080
   end
 
   # returns NO formulas in excel spreadsheets
   def formulas(sheet=nil)
-    raise EXCEL_NO_FORMULAS
+    wait_for_version_080
   end
 
   # Given a cell, return the cell's font
@@ -225,6 +219,22 @@ class Excel < GenericSpreadsheet
     sheet = @default_sheet unless sheet
     read_cells(sheet) unless @cells_read[sheet]
     @cell[sheet].inspect
+  end
+
+  # returns the row,col values of the labelled cell
+  # (nil,nil) if label is not defined
+  # sheet parameter is not really needed because label names are global
+  # to the whole spreadsheet
+  def label(labelname,sheet=nil)
+    sheet = @default_sheet unless sheet
+    read_cells(sheet) unless @cells_read[sheet]
+    if @labels.has_key? labelname
+      return @labels[labelname][1].to_i,
+        GenericSpreadsheet.letter_to_number(@labels[labelname][2]),
+        @labels[labelname][0]
+    else
+      return nil,nil,nil
+    end
   end
 
   private
@@ -321,7 +331,7 @@ class Excel < GenericSpreadsheet
     @fonts[sheet] = {} unless @fonts[sheet]
     @fonts[sheet][key] = font
     
-    case vt # @cell_type[sheet][key]
+    case vt 
     when :float
       @cell[sheet][key] = v.to_f
     when :string
@@ -355,7 +365,7 @@ class Excel < GenericSpreadsheet
       (0..row.size).each do |cell_index|
         cell = row.at(cell_index)
         next if cell.nil?  #skip empty cells
-        next if cell.class == Spreadsheet::Formula && cell.value.nil? # skip empty formla cells
+        next if cell.class == Spreadsheet::Formula && cell.value.nil? # skip empty formula cells
         if date_or_time?(row, cell_index)
           vt, v = read_cell_date_or_time(row, cell_index)
         else
@@ -414,8 +424,8 @@ class Excel < GenericSpreadsheet
         datetime = row.datetime(idx)
       end    
       if datetime.hour != 0 or
-         datetime.min != 0 or
-         datetime.sec != 0 
+          datetime.min != 0 or
+          datetime.sec != 0
         value_type = :datetime
         value = datetime
       else
@@ -450,19 +460,14 @@ class Excel < GenericSpreadsheet
     return value_type, value
   end
   private :read_cell
-  
-  #TODO: testing only
-  #  def inject_null_characters(str)
-  #    if str.class != String
-  #      return str
-  #    end
-  #    new_str=''
-  #    0.upto(str.size-1) do |i|
-  #      new_str += str[i,1]
-  #      new_str += "\000"
-  #    end
-  #    new_str
-  #  end
-  #
+
+  def wait_for_version_080
+    if Spreadsheet::VERSION<='0.8.0'
+      raise EXCEL_NO_FORMULAS+
+        " We have to wait for the 0.8.0 version of the Spreadsheet gem (currently used version is #{Spreadsheet::VERSION})"
+    else
+      raise 'Thomas should implement formulas from Spreadsheet gem'
+    end
+  end
 
 end
