@@ -36,6 +36,7 @@ module Spreadsheet
   module Excel
     class Row < Spreadsheet::Row
       def _datetime data # :nodoc:
+        # puts "Hello"
         return data if data.is_a?(DateTime)
         base = @worksheet.date_base
         date = base + data.to_f
